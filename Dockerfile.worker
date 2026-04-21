@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.7
+# ---------------------------------------------------------------------------
+# Worker image — runs BullMQ jobs (daily-sync fanout + monthly-report dispatch).
+# Shares the same code base as the web app but starts `tsx src/worker/index.ts`
+# instead of the Next.js server.
+# ---------------------------------------------------------------------------
+
+FROM node:22-alpine AS deps
+RUN apk add --no-cache libc6-compat openssl
+WORKDIR /app
+COPY package.json package-lock.json* ./
+COPY prisma ./prisma
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+
+FROM node:22-alpine AS runner
+RUN apk add --no-cache openssl
+WORKDIR /app
+ENV NODE_ENV=production
+
+RUN addgroup --system --gid 1001 nodejs \
+ && adduser --system --uid 1001 worker
+
+COPY --from=deps --chown=worker:nodejs /app/node_modules ./node_modules
+COPY --chown=worker:nodejs package.json tsconfig.json ./
+COPY --chown=worker:nodejs prisma ./prisma
+COPY --chown=worker:nodejs src ./src
+
+RUN npx prisma generate
+
+USER worker
+
+CMD ["npx", "tsx", "src/worker/index.ts"]

@@ -1,0 +1,24 @@
+node_modules
+.next
+out
+dist
+coverage
+.env
+.env.local
+.env.production
+.env.development.local
+.DS_Store
+*.log
+next-env.d.ts
+tsconfig.tsbuildinfo
+
+# Prisma
+prisma/*.db
+prisma/*.db-journal
+
+# IDE
+.vscode
+.idea
+
+# Docker
+.docker-data

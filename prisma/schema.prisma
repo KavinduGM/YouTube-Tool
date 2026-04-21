@@ -1,0 +1,395 @@
+// Social Analytics Platform — Prisma schema
+// Milestone 1: Auth + foundational models.
+// Time-series + metric detail tables are added in later milestones.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// AUTH (NextAuth v5 / Auth.js)
+// ============================================================================
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  passwordHash  String?
+  emailVerified DateTime?
+  image         String?
+  role          UserRole  @default(ADMIN)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts Account[]
+  sessions Session[]
+}
+
+enum UserRole {
+  ADMIN
+  VIEWER
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ============================================================================
+// CLIENTS & CHANNELS (Foundation — extended in Milestone 2+)
+// ============================================================================
+
+model Client {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  contactName String?
+  contactEmail String?
+  industry    String?
+  notes       String?  @db.Text
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  channels            Channel[]
+  pendingYtConnections PendingYouTubeConnection[]
+  reportLogs          ReportLog[]
+}
+
+/// Stores an in-flight Google OAuth grant awaiting the admin's channel selection.
+/// After the user picks which of the authorized Google account's YouTube channels
+/// to track, we create real Channel records sharing these encrypted tokens and
+/// delete the pending row.
+model PendingYouTubeConnection {
+  id             String   @id @default(cuid())
+  clientId       String
+  accessToken    String   @db.Text /// encrypted
+  refreshToken   String?  @db.Text /// encrypted
+  tokenExpiresAt DateTime
+  scope          String?  @db.Text
+  /// Snapshot of channels.list(mine=true) — array of { id, title, handle, description, thumbnailUrl, subscribers, videoCount, viewCount, uploadsPlaylistId }
+  discoveredChannels Json
+  expiresAt      DateTime /// hard TTL — we treat any row past this as dead
+  createdAt      DateTime @default(now())
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([expiresAt])
+}
+
+model Channel {
+  id          String      @id @default(cuid())
+  clientId    String
+  platform    Platform
+  displayName String
+  // External identifier (YouTube channel ID, LinkedIn page vanity, etc.)
+  externalId  String?
+  handle      String?
+  url         String?
+  avatarUrl   String?
+  // OAuth tokens (YouTube) — encrypted at rest in later milestone
+  accessToken  String? @db.Text
+  refreshToken String? @db.Text
+  tokenExpiresAt DateTime?
+  scope        String? @db.Text
+  connected    Boolean  @default(false)
+  connectedAt  DateTime?
+  lastSyncedAt DateTime?
+  syncStatus   SyncStatus @default(IDLE)
+  syncError    String?   @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  // YouTube back-relations
+  ytSnapshots        YouTubeChannelSnapshot[]
+  ytVideos           YouTubeVideo[]
+  ytAudience         YouTubeAudienceSnapshot[]
+  ytGeography        YouTubeGeographySnapshot[]
+  ytTrafficSources   YouTubeTrafficSourceSnapshot[]
+  ytDevices          YouTubeDeviceSnapshot[]
+  syncLogs           SyncLog[]
+
+  @@index([clientId])
+  @@index([platform])
+}
+
+enum Platform {
+  YOUTUBE
+  LINKEDIN
+}
+
+enum SyncStatus {
+  IDLE
+  SYNCING
+  SUCCESS
+  ERROR
+}
+
+// ============================================================================
+// YOUTUBE DATA (Milestone 3)
+// ============================================================================
+
+/// Daily channel-level snapshot (cumulative stats + daily deltas from Analytics API)
+model YouTubeChannelSnapshot {
+  id         String   @id @default(cuid())
+  channelId  String
+  /// The "as-of" day this snapshot covers (UTC, 00:00:00)
+  date       DateTime @db.Date
+  // Cumulative stats from Data API
+  subscribers BigInt?
+  viewCount   BigInt?
+  videoCount  Int?
+  // Daily metrics from Analytics API (for `date`)
+  views              BigInt?
+  watchTimeMinutes   Float?
+  averageViewDuration Float? // seconds
+  averageViewPercentage Float? // percent
+  likes              BigInt?
+  dislikes           BigInt?
+  comments           BigInt?
+  shares             BigInt?
+  subscribersGained  BigInt?
+  subscribersLost    BigInt?
+  estimatedRevenue   Float?
+  impressions        BigInt?
+  impressionsCtr     Float? // 0..1
+
+  createdAt DateTime @default(now())
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, date])
+  @@index([channelId, date])
+}
+
+/// YouTube video metadata (mostly static — updated when title/desc/thumbnail change)
+model YouTubeVideo {
+  id           String   @id @default(cuid())
+  channelId    String
+  videoId      String   /// YouTube video ID
+  title        String   @db.Text
+  description  String?  @db.Text
+  publishedAt  DateTime
+  duration     Int?     /// seconds
+  thumbnailUrl String?
+  tags         String[] @default([])
+  categoryId   String?
+  defaultLanguage String?
+  // Cumulative (from Data API) — latest known
+  viewCount    BigInt?
+  likeCount    BigInt?
+  commentCount BigInt?
+  favoriteCount BigInt?
+  // Flags
+  isShort      Boolean  @default(false)
+  isLive       Boolean  @default(false)
+
+  firstSeenAt  DateTime @default(now())
+  lastUpdatedAt DateTime @updatedAt
+
+  channel  Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  metrics  YouTubeVideoMetric[]
+
+  @@unique([channelId, videoId])
+  @@index([channelId])
+  @@index([publishedAt])
+}
+
+/// Daily per-video metrics (from Analytics API, dimensions=day,video)
+model YouTubeVideoMetric {
+  id        String   @id @default(cuid())
+  videoId   String
+  channelId String
+  date      DateTime @db.Date
+
+  views              BigInt?
+  watchTimeMinutes   Float?
+  averageViewDuration Float?
+  averageViewPercentage Float?
+  likes              BigInt?
+  comments           BigInt?
+  shares             BigInt?
+  subscribersGained  BigInt?
+  subscribersLost    BigInt?
+  estimatedRevenue   Float?
+  impressions        BigInt?
+  impressionsCtr     Float?
+
+  createdAt DateTime @default(now())
+
+  video YouTubeVideo @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@unique([videoId, date])
+  @@index([channelId, date])
+  @@index([videoId, date])
+}
+
+/// Audience demographics (age + gender) — not per-day; we roll up each sync
+model YouTubeAudienceSnapshot {
+  id        String   @id @default(cuid())
+  channelId String
+  /// End of the reporting window (typically last 28 days)
+  periodEnd DateTime @db.Date
+  ageGroup  String   /// "age13-17", "age18-24", "age25-34", "age35-44", "age45-54", "age55-64", "age65-"
+  gender    String   /// "male", "female", "user_specified" (other), "-"
+  viewerPercentage Float /// 0..100
+
+  createdAt DateTime @default(now())
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, periodEnd, ageGroup, gender])
+  @@index([channelId, periodEnd])
+}
+
+model YouTubeGeographySnapshot {
+  id         String   @id @default(cuid())
+  channelId  String
+  periodEnd  DateTime @db.Date
+  country    String   /// ISO-3166 alpha-2
+  views      BigInt
+  watchTimeMinutes Float?
+  averageViewDuration Float?
+
+  createdAt DateTime @default(now())
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, periodEnd, country])
+  @@index([channelId, periodEnd])
+}
+
+model YouTubeTrafficSourceSnapshot {
+  id            String   @id @default(cuid())
+  channelId     String
+  periodEnd     DateTime @db.Date
+  insightTrafficSourceType String /// e.g. "YT_SEARCH", "EXT_URL", "SUBSCRIBER", "RELATED_VIDEO"
+  views         BigInt
+  watchTimeMinutes Float?
+
+  createdAt DateTime @default(now())
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, periodEnd, insightTrafficSourceType])
+  @@index([channelId, periodEnd])
+}
+
+model YouTubeDeviceSnapshot {
+  id         String   @id @default(cuid())
+  channelId  String
+  periodEnd  DateTime @db.Date
+  deviceType String   /// "MOBILE", "DESKTOP", "TABLET", "TV", "GAME_CONSOLE", "UNKNOWN_PLATFORM"
+  views      BigInt
+  watchTimeMinutes Float?
+
+  createdAt DateTime @default(now())
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, periodEnd, deviceType])
+  @@index([channelId, periodEnd])
+}
+
+/// Audit trail of sync runs
+model SyncLog {
+  id         String     @id @default(cuid())
+  channelId  String
+  kind       String     /// "full", "metadata", "analytics", "videos"
+  status     SyncStatus
+  startedAt  DateTime   @default(now())
+  finishedAt DateTime?
+  rowsWritten Int       @default(0)
+  errorMessage String?  @db.Text
+  detail     Json?
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([channelId, startedAt])
+}
+
+// ============================================================================
+// SETTINGS
+// ============================================================================
+
+model AppSetting {
+  key   String @id
+  value String @db.Text
+  updatedAt DateTime @updatedAt
+}
+
+// ============================================================================
+// REPORTS (Milestone 8)
+// ============================================================================
+
+/// Record of a generated monthly report for a client — one row per run, whether
+/// it was triggered manually from the UI or by the scheduled worker.
+model ReportLog {
+  id             String   @id @default(cuid())
+  clientId       String
+  /// Reference month the report covers (first day of month, UTC).
+  reportMonth    DateTime @db.Date
+  channelCount   Int      @default(0)
+  recipients     String   @db.Text /// comma-separated list used for delivery
+  status         ReportStatus @default(PENDING)
+  deliveredAt    DateTime?
+  errorMessage   String?  @db.Text
+  messageId      String?  /// Resend provider id
+  /// Trigger source — "manual" (UI button) or "scheduled" (worker).
+  triggeredBy    String   @default("manual")
+  /// Size in bytes of the generated PDF, for quick inspection in the UI.
+  pdfBytes       Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, reportMonth])
+  @@index([status])
+}
+
+enum ReportStatus {
+  PENDING
+  SENT
+  FAILED
+}
