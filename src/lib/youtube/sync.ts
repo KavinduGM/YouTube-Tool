@@ -232,9 +232,20 @@ export async function syncYouTubeChannel(channelId: string): Promise<SyncResult>
           true
         );
       } catch (e) {
-        // Retry without monetary metrics (channel may not be monetized)
+        // Retry without monetary metrics. YouTube returns different errors
+        // depending on *why* they're unavailable:
+        //   • 403 / "monetary" — scope missing or channel not in YPP
+        //   • 400 "Unknown identifier (impressions|cpm|...)" — channel has
+        //     never been monetized, so these columns literally don't exist
+        //     for this account and YouTube rejects the whole request.
+        // In every one of those cases, the right move is to re-run with the
+        // core non-monetary metric set rather than failing the entire sync.
         const msg = e instanceof Error ? e.message : String(e);
-        if (/monetary|403|402/i.test(msg)) {
+        const isMonetaryUnavailable =
+          /monetary|403|402/i.test(msg) ||
+          /Unknown identifier/i.test(msg) ||
+          /impression|cpm|estimatedRevenue/i.test(msg);
+        if (isMonetaryUnavailable) {
           channelDaily = await getDailyChannelMetrics(
             externalId,
             fmtDate(start),

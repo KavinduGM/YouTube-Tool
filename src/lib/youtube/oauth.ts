@@ -23,7 +23,11 @@ export function googleAuthUrl(state: string): string {
     redirect_uri: redirect,
     response_type: "code",
     access_type: "offline",
-    prompt: "consent",
+    // `select_account` forces Google's account chooser every time, so admins
+    // can deliberately pick the Brand Account that owns the channels they
+    // actually manage — otherwise Google silently reuses the most recent
+    // personal Gmail and hides every Brand Account they have manager access to.
+    prompt: "consent select_account",
     include_granted_scopes: "true",
     scope: YOUTUBE_SCOPES.join(" "),
     state,
