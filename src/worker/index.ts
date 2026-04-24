@@ -18,18 +18,24 @@ loadEnvConfig(process.cwd());
 import { Worker } from "bullmq";
 import { prisma } from "@/lib/prisma";
 import { redis } from "@/lib/redis";
-import { syncYouTubeChannel } from "@/lib/youtube/sync";
+import {
+  syncYouTubeChannel,
+  syncYouTubeChannelLight,
+} from "@/lib/youtube/sync";
 import { generateAndSendMonthlyReportAction } from "@/lib/actions/reports";
 import {
   getDailySyncQueue,
+  getLightSyncQueue,
   getMonthlyReportQueue,
   QUEUE_NAMES,
   type DailySyncJob,
+  type LightSyncJob,
   type MonthlyReportJob,
 } from "@/lib/queue/queues";
 import {
   reconcileSchedules,
   SYNC_SCHEDULER_KEY,
+  LIGHT_SYNC_SCHEDULER_KEY,
   REPORT_SCHEDULER_KEY,
 } from "@/lib/queue/scheduler";
 
@@ -70,6 +76,23 @@ async function fanoutDailySync() {
   log("info", "daily-sync fanout: enqueued", { count: channels.length });
 }
 
+async function fanoutLightSync() {
+  const channels = await prisma.channel.findMany({
+    where: { platform: "YOUTUBE", connected: true },
+    select: { id: true },
+  });
+  if (channels.length === 0) return;
+  const q = getLightSyncQueue();
+  for (const c of channels) {
+    await q.add(
+      "light-sync-channel",
+      { channelId: c.id },
+      { jobId: `light-${c.id}-${Date.now()}` }
+    );
+  }
+  log("info", "light-sync fanout: enqueued", { count: channels.length });
+}
+
 async function fanoutMonthlyReport() {
   const clients = await prisma.client.findMany({
     where: { channels: { some: { platform: "YOUTUBE", connected: true } } },
@@ -105,6 +128,17 @@ async function handleChannelSync(channelId: string) {
     channelId,
     rowsWritten: result.rowsWritten,
   });
+}
+
+async function handleLightChannelSync(channelId: string) {
+  const result = await syncYouTubeChannelLight(channelId);
+  if (!result.ok) {
+    // Light-sync failures are noisy-by-design but shouldn't flag the channel
+    // as broken — the deep sync owns the user-facing sync status.
+    log("warn", "light-sync: failed", { channelId, error: result.error });
+    return;
+  }
+  log("info", "light-sync: ok", { channelId });
 }
 
 async function handleClientReport(clientId: string, month?: number, year?: number) {
@@ -143,6 +177,19 @@ function startWorkers() {
     { connection: redis, concurrency: 2 }
   );
 
+  const lightSyncWorker = new Worker<LightSyncJob>(
+    QUEUE_NAMES.lightSync,
+    async (job) => {
+      if (job.name === LIGHT_SYNC_SCHEDULER_KEY) {
+        await fanoutLightSync();
+        return;
+      }
+      await handleLightChannelSync(job.data.channelId);
+    },
+    // Higher concurrency is safe — each job is a single Data-API call.
+    { connection: redis, concurrency: 5 }
+  );
+
   const reportWorker = new Worker<MonthlyReportJob>(
     QUEUE_NAMES.monthlyReport,
     async (job) => {
@@ -167,6 +214,13 @@ function startWorkers() {
       error: err.message,
     });
   });
+  lightSyncWorker.on("failed", (job, err) => {
+    log("warn", "light-sync job failed", {
+      jobId: job?.id,
+      name: job?.name,
+      error: err.message,
+    });
+  });
   reportWorker.on("failed", (job, err) => {
     log("error", "monthly-report job failed", {
       jobId: job?.id,
@@ -176,7 +230,7 @@ function startWorkers() {
     });
   });
 
-  return { syncWorker, reportWorker };
+  return { syncWorker, lightSyncWorker, reportWorker };
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +249,7 @@ async function main() {
     });
   }
 
-  const { syncWorker, reportWorker } = startWorkers();
+  const { syncWorker, lightSyncWorker, reportWorker } = startWorkers();
 
   // Re-reconcile every 15 minutes to pick up settings changes from the UI.
   const reconcileInterval = setInterval(async () => {
@@ -211,7 +265,11 @@ async function main() {
   const shutdown = async (signal: string) => {
     log("info", "worker: shutting down", { signal });
     clearInterval(reconcileInterval);
-    await Promise.allSettled([syncWorker.close(), reportWorker.close()]);
+    await Promise.allSettled([
+      syncWorker.close(),
+      lightSyncWorker.close(),
+      reportWorker.close(),
+    ]);
     await prisma.$disconnect();
     process.exit(0);
   };

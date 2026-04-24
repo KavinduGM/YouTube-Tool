@@ -131,6 +131,10 @@ model Channel {
   connected    Boolean  @default(false)
   connectedAt  DateTime?
   lastSyncedAt DateTime?
+  /// Timestamp of the most recent hourly light-sync (cumulative channel
+  /// counters only). Separate from lastSyncedAt so the UI can show a
+  /// "totals as of X" stamp distinct from the deep analytics pull.
+  lastLightSyncedAt DateTime?
   syncStatus   SyncStatus @default(IDLE)
   syncError    String?   @db.Text
 

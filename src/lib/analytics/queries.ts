@@ -448,3 +448,21 @@ export async function getLatestSnapshot(channelId: string) {
     orderBy: { date: "desc" },
   });
 }
+
+/**
+ * Date through which per-day analytics are present. Distinct from
+ * `getLatestSnapshot` because hourly light-sync writes a snapshot for today
+ * containing cumulative counters but no per-day `views` — so the analytics
+ * window is bounded by the most recent snapshot that actually carries
+ * Analytics-API data.
+ */
+export async function getAnalyticsThroughDate(
+  channelId: string
+): Promise<Date | null> {
+  const row = await prisma.youTubeChannelSnapshot.findFirst({
+    where: { channelId, views: { not: null } },
+    orderBy: { date: "desc" },
+    select: { date: true },
+  });
+  return row?.date ?? null;
+}

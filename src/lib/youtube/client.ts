@@ -212,8 +212,17 @@ async function runReport(
 }
 
 // Metrics we pull daily at the channel level.
-// NB: some metrics (estimatedRevenue, impressions*) require yt-analytics-monetary scope
-// AND a monetized channel — we handle missing columns gracefully.
+//
+// YouTube Analytics returns different metric sets depending on channel state:
+//   • Full — monetized (YPP) channels with yt-analytics-monetary scope get
+//     impressions + CTR + revenue + CPM in the same request.
+//   • Analytics-only — non-monetized channels can still report impressions +
+//     CTR, but asking for revenue/CPM triggers a 400 "Unknown identifier".
+//   • Core — very new / tiny channels may not have impressions data either.
+//
+// We always request the tier the caller asks for and let sync.ts cascade
+// down on failure. Splitting the monetary set in two (vs. the original
+// all-or-nothing) recovers impressions for non-YPP channels.
 export const DAILY_CHANNEL_METRICS = [
   "views",
   "estimatedMinutesWatched",
@@ -227,23 +236,34 @@ export const DAILY_CHANNEL_METRICS = [
   "subscribersLost",
 ] as const;
 
-export const DAILY_CHANNEL_MONETARY_METRICS = [
-  "estimatedRevenue",
+/** Impressions + CTR. Available on most channels, even non-monetized. */
+export const DAILY_CHANNEL_IMPRESSION_METRICS = [
   "impressions",
-  "cpm",
   "impressionClickThroughRate",
 ] as const;
+
+/** Revenue + CPM. Require yt-analytics-monetary scope AND a YPP channel. */
+export const DAILY_CHANNEL_REVENUE_METRICS = [
+  "estimatedRevenue",
+  "cpm",
+] as const;
+
+export type MonetaryTier = "full" | "impressions" | "core";
 
 export async function getDailyChannelMetrics(
   channelExternalId: string,
   startDate: string,
   endDate: string,
   accessToken: string,
-  includeMonetary = true
+  tier: MonetaryTier = "full"
 ): Promise<YTAnalyticsReport> {
-  const metrics = includeMonetary
-    ? [...DAILY_CHANNEL_METRICS, ...DAILY_CHANNEL_MONETARY_METRICS]
-    : [...DAILY_CHANNEL_METRICS];
+  const metrics: string[] = [...DAILY_CHANNEL_METRICS];
+  if (tier === "full" || tier === "impressions") {
+    metrics.push(...DAILY_CHANNEL_IMPRESSION_METRICS);
+  }
+  if (tier === "full") {
+    metrics.push(...DAILY_CHANNEL_REVENUE_METRICS);
+  }
 
   return runReport(
     {

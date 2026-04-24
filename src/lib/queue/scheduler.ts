@@ -8,11 +8,13 @@
 import { prisma } from "@/lib/prisma";
 import {
   getDailySyncQueue,
+  getLightSyncQueue,
   getMonthlyReportQueue,
   QUEUE_NAMES,
 } from "./queues";
 
 const SYNC_SCHEDULER_KEY = "daily-sync-fanout";
+const LIGHT_SYNC_SCHEDULER_KEY = "light-sync-fanout";
 const REPORT_SCHEDULER_KEY = "monthly-report-fanout";
 
 async function getSetting(key: string, fallback: string): Promise<string> {
@@ -34,11 +36,16 @@ export async function reconcileSchedules() {
   const day = clampDay(await getSetting("report_day_of_month", "1"));
   const tz = await getSetting("report_timezone", "UTC");
 
-  // Daily sync fanout — every day at {hour} UTC
+  // Daily deep sync — every day at {hour} UTC
   const syncCron = `0 ${hour} * * *`;
-  const reportCron = `0 6 ${day} * *`; // 06:00 local; worker applies tz below
+  // Hourly light sync — every hour at :05 UTC (offset so it doesn't collide
+  // with the deep sync when `hour === <current hour>`).
+  const lightSyncCron = `5 * * * *`;
+  // Monthly report — 06:00 local on {day}; worker applies tz below
+  const reportCron = `0 6 ${day} * *`;
 
   const syncQ = getDailySyncQueue();
+  const lightSyncQ = getLightSyncQueue();
   const reportQ = getMonthlyReportQueue();
 
   // Remove any existing repeatables we own so we can replace them cleanly.
@@ -46,6 +53,12 @@ export async function reconcileSchedules() {
   for (const r of syncRepeatables) {
     if (r.name === SYNC_SCHEDULER_KEY) {
       await syncQ.removeRepeatableByKey(r.key);
+    }
+  }
+  const lightRepeatables = await lightSyncQ.getRepeatableJobs();
+  for (const r of lightRepeatables) {
+    if (r.name === LIGHT_SYNC_SCHEDULER_KEY) {
+      await lightSyncQ.removeRepeatableByKey(r.key);
     }
   }
   const reportRepeatables = await reportQ.getRepeatableJobs();
@@ -64,6 +77,14 @@ export async function reconcileSchedules() {
       jobId: SYNC_SCHEDULER_KEY,
     }
   );
+  await lightSyncQ.add(
+    LIGHT_SYNC_SCHEDULER_KEY,
+    { channelId: "__fanout__" },
+    {
+      repeat: { pattern: lightSyncCron, tz: "UTC" },
+      jobId: LIGHT_SYNC_SCHEDULER_KEY,
+    }
+  );
   await reportQ.add(
     REPORT_SCHEDULER_KEY,
     { clientId: "__fanout__" },
@@ -75,6 +96,7 @@ export async function reconcileSchedules() {
 
   return {
     sync: { queue: QUEUE_NAMES.dailySync, cron: syncCron, tz: "UTC" },
+    lightSync: { queue: QUEUE_NAMES.lightSync, cron: lightSyncCron, tz: "UTC" },
     report: { queue: QUEUE_NAMES.monthlyReport, cron: reportCron, tz },
   };
 }
@@ -91,4 +113,8 @@ function clampDay(s: string): number {
   return Math.min(28, Math.max(1, n));
 }
 
-export { SYNC_SCHEDULER_KEY, REPORT_SCHEDULER_KEY };
+export {
+  SYNC_SCHEDULER_KEY,
+  LIGHT_SYNC_SCHEDULER_KEY,
+  REPORT_SCHEDULER_KEY,
+};

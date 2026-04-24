@@ -7,6 +7,7 @@ import {
   Mail,
   Settings as SettingsIcon,
   Users,
+  AlertTriangle,
 } from "lucide-react";
 import {
   Card,
@@ -57,8 +58,24 @@ export default async function ReportsPage() {
     .filter(Boolean);
   const dayOfMonth = settings.report_day_of_month ?? "1";
   const timezone = settings.report_timezone ?? "UTC";
+  const resendFrom = process.env.RESEND_FROM ?? "";
   const resendConfigured =
-    !!process.env.RESEND_API_KEY && !!process.env.RESEND_FROM;
+    !!process.env.RESEND_API_KEY && !!resendFrom;
+
+  // Look at the last handful of report runs to see if Resend is rejecting the
+  // sender domain. This is by far the most common "my reports don't send"
+  // cause — the placeholder `yourdomain.com` in the env never got replaced
+  // with a domain the admin verified at resend.com/domains.
+  const recentFailure = reports.find(
+    (r) =>
+      r.status === "FAILED" &&
+      r.errorMessage &&
+      /domain is not verified|not\s+authorized|validation_error/i.test(
+        r.errorMessage
+      )
+  );
+  const fromLooksPlaceholder = /yourdomain\.com|example\.com/i.test(resendFrom);
+  const resendSenderBroken = !!recentFailure || fromLooksPlaceholder;
 
   return (
     <div className="space-y-6">
@@ -93,6 +110,63 @@ export default async function ReportsPage() {
                 in the environment. Report generation will fail until these are
                 present.
               </CardDescription>
+            </div>
+          </CardHeader>
+        </Card>
+      )}
+
+      {resendConfigured && resendSenderBroken && (
+        <Card className="border-destructive/40 bg-destructive/5">
+          <CardHeader className="flex flex-row items-start gap-3 space-y-0">
+            <AlertTriangle
+              className="mt-0.5 h-4 w-4 text-destructive"
+              strokeWidth={1.75}
+            />
+            <div className="space-y-2">
+              <div>
+                <CardTitle className="text-sm">
+                  Sender domain not verified at Resend
+                </CardTitle>
+                <CardDescription>
+                  Resend is rejecting emails from{" "}
+                  <code className="rounded bg-muted px-1 text-xs">
+                    {resendFrom || "(unset)"}
+                  </code>
+                  {fromLooksPlaceholder
+                    ? " — this still looks like the example placeholder."
+                    : recentFailure?.errorMessage
+                      ? ` — last error: "${recentFailure.errorMessage.slice(0, 160)}"`
+                      : "."}
+                </CardDescription>
+              </div>
+              <div className="text-xs leading-relaxed text-muted-foreground">
+                Fix in three steps:
+                <ol className="mt-1 list-decimal space-y-0.5 pl-4">
+                  <li>
+                    Add and verify your sending domain at{" "}
+                    <a
+                      href="https://resend.com/domains"
+                      target="_blank"
+                      rel="noreferrer noopener"
+                      className="text-foreground underline underline-offset-2"
+                    >
+                      resend.com/domains
+                    </a>{" "}
+                    (add the SPF + DKIM + DMARC DNS records it gives you).
+                  </li>
+                  <li>
+                    Update{" "}
+                    <code className="rounded bg-muted px-1">RESEND_FROM</code>{" "}
+                    in your Dokploy environment to an address on that verified
+                    domain, e.g.{" "}
+                    <code className="rounded bg-muted px-1">
+                      Social Analytics &lt;reports@yourverifieddomain.com&gt;
+                    </code>
+                    .
+                  </li>
+                  <li>Redeploy the app, then retry Generate &amp; email.</li>
+                </ol>
+              </div>
             </div>
           </CardHeader>
         </Card>
@@ -160,7 +234,8 @@ export default async function ReportsPage() {
                     disabled={
                       c.youtubeChannelCount === 0 ||
                       recipients.length === 0 ||
-                      !resendConfigured
+                      !resendConfigured ||
+                      fromLooksPlaceholder
                     }
                   />
                 </div>

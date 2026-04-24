@@ -31,6 +31,7 @@ import {
   getTrafficSourceBreakdown,
   getDeviceBreakdown,
   getLatestSnapshot,
+  getAnalyticsThroughDate,
 } from "@/lib/analytics/queries";
 
 export const dynamic = "force-dynamic";
@@ -88,6 +89,7 @@ export default async function ChannelDashboardPage({
     traffic,
     devices,
     latest,
+    analyticsThrough,
   ] = await Promise.all([
     getChannelKpis(id, range),
     getDailySeries(id, range),
@@ -96,6 +98,7 @@ export default async function ChannelDashboardPage({
     getTrafficSourceBreakdown(id),
     getDeviceBreakdown(id),
     getLatestSnapshot(id),
+    getAnalyticsThroughDate(id),
   ]);
 
   const hasAnyData = daily.length > 0 || !!latest;
@@ -179,10 +182,38 @@ export default async function ChannelDashboardPage({
       {hasAnyData && (
         <>
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="text-sm text-muted-foreground">
-              Showing{" "}
-              <strong className="text-foreground">{RANGE_LABEL[range]}</strong>
-              {" "}· compared with previous period
+            <div className="space-y-0.5 text-sm text-muted-foreground">
+              <div>
+                Showing{" "}
+                <strong className="text-foreground">
+                  {RANGE_LABEL[range]}
+                </strong>
+                {" "}· compared with previous period
+              </div>
+              {analyticsThrough && (
+                <div className="text-xs">
+                  Analytics through{" "}
+                  <span className="text-foreground">
+                    {analyticsThrough.toLocaleDateString("en-US", {
+                      year: "numeric",
+                      month: "short",
+                      day: "numeric",
+                      timeZone: "UTC",
+                    })}
+                  </span>{" "}
+                  (UTC)
+                  {channel.lastLightSyncedAt && (
+                    <>
+                      {" · Totals as of "}
+                      <span className="text-foreground">
+                        {formatDistanceToNow(channel.lastLightSyncedAt, {
+                          addSuffix: true,
+                        })}
+                      </span>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
             <RangeSelector current={range} />
           </div>

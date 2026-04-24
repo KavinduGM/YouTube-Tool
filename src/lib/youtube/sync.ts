@@ -28,6 +28,8 @@ import {
   listUploadVideoIds,
   parseIsoDuration,
   reportToObjects,
+  type MonetaryTier,
+  type YTAnalyticsReport,
 } from "./client";
 
 type SyncResult = {
@@ -65,6 +67,59 @@ function bigInt(v: unknown): bigint | null {
   const n = num(v);
   if (n === null) return null;
   return BigInt(Math.round(n));
+}
+
+/**
+ * Request daily channel analytics and cascade through monetary tiers on
+ * failure. Returns the successful report plus records which tier actually
+ * worked in `detail.monetary` so the sync log shows what happened.
+ *
+ * Why three tiers instead of all-or-nothing:
+ *   - `full` includes estimatedRevenue + cpm. Only YPP-enrolled channels
+ *     have these; non-YPP accounts get 400 "Unknown identifier (cpm)".
+ *   - `impressions` drops revenue but keeps impressions + CTR. Most
+ *     channels with real viewership have this data.
+ *   - `core` drops monetary entirely. Brand-new or tiny channels that
+ *     don't report impressions either still complete the sync.
+ */
+async function fetchDailyWithFallback(
+  externalId: string,
+  startDate: string,
+  endDate: string,
+  accessToken: string,
+  detail: Record<string, number | string>
+): Promise<YTAnalyticsReport> {
+  const tiers: MonetaryTier[] = ["full", "impressions", "core"];
+  let lastErr: unknown;
+  for (const tier of tiers) {
+    try {
+      const report = await getDailyChannelMetrics(
+        externalId,
+        startDate,
+        endDate,
+        accessToken,
+        tier
+      );
+      detail.monetary = tier;
+      return report;
+    } catch (e) {
+      lastErr = e;
+      const msg = e instanceof Error ? e.message : String(e);
+      // Only cascade on the recognizable "this column isn't available for this
+      // channel" errors. Real network failures should still surface.
+      const isColumnUnavailable =
+        /Unknown identifier/i.test(msg) ||
+        /monetary|403|402/i.test(msg) ||
+        /impression|cpm|estimatedRevenue/i.test(msg);
+      if (!isColumnUnavailable) throw e;
+      // loop continues to next tier
+    }
+  }
+  // Shouldn't happen — `core` has no monetary columns — but surface the last
+  // error if every tier failed.
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error("Failed to fetch daily channel metrics");
 }
 
 export async function syncYouTubeChannel(channelId: string): Promise<SyncResult> {
@@ -222,42 +277,17 @@ export async function syncYouTubeChannel(channelId: string): Promise<SyncResult>
     const end = yesterday;
 
     if (start <= end) {
-      let channelDaily;
-      try {
-        channelDaily = await getDailyChannelMetrics(
-          externalId,
-          fmtDate(start),
-          fmtDate(end),
-          accessToken,
-          true
-        );
-      } catch (e) {
-        // Retry without monetary metrics. YouTube returns different errors
-        // depending on *why* they're unavailable:
-        //   • 403 / "monetary" — scope missing or channel not in YPP
-        //   • 400 "Unknown identifier (impressions|cpm|...)" — channel has
-        //     never been monetized, so these columns literally don't exist
-        //     for this account and YouTube rejects the whole request.
-        // In every one of those cases, the right move is to re-run with the
-        // core non-monetary metric set rather than failing the entire sync.
-        const msg = e instanceof Error ? e.message : String(e);
-        const isMonetaryUnavailable =
-          /monetary|403|402/i.test(msg) ||
-          /Unknown identifier/i.test(msg) ||
-          /impression|cpm|estimatedRevenue/i.test(msg);
-        if (isMonetaryUnavailable) {
-          channelDaily = await getDailyChannelMetrics(
-            externalId,
-            fmtDate(start),
-            fmtDate(end),
-            accessToken,
-            false
-          );
-          detail.monetary = "skipped";
-        } else {
-          throw e;
-        }
-      }
+      // Tiered fallback: try the richest metric set first, then drop revenue,
+      // then drop impressions too. This way monetized channels get everything,
+      // non-YPP channels still get impressions+CTR, and brand-new channels
+      // that don't report any monetary columns at all still finish the sync.
+      const channelDaily = await fetchDailyWithFallback(
+        externalId,
+        fmtDate(start),
+        fmtDate(end),
+        accessToken,
+        detail
+      );
 
       const rows = reportToObjects(channelDaily);
       detail.channelDailyRows = rows.length;
@@ -534,6 +564,122 @@ export async function syncYouTubeChannel(channelId: string): Promise<SyncResult>
         },
       }),
     ]);
+    return { ok: false, error: msg, rowsWritten, detail };
+  }
+}
+
+/**
+ * Hourly lightweight sync — only refreshes cumulative channel stats from the
+ * Data API (subscribers, total views, total videos). No per-day analytics,
+ * no per-video fetches, no audience/geography rollups.
+ *
+ * Why: the Data API's cumulative counters update in near-real-time, so
+ * hourly refreshes keep the dashboard's "Subscribers" / "Total views" cards
+ * current. The Analytics API, on the other hand, only settles once a day —
+ * calling it hourly would burn quota to receive the same numbers 24×.
+ *
+ * Runs in seconds per channel and uses 1 Data-API unit. Safe to fanout
+ * across every connected channel on every cron tick.
+ */
+export async function syncYouTubeChannelLight(
+  channelId: string
+): Promise<SyncResult> {
+  const startedAt = new Date();
+  const log = await prisma.syncLog.create({
+    data: { channelId, kind: "light", status: "SYNCING", startedAt },
+  });
+
+  const detail: Record<string, number | string> = {};
+  let rowsWritten = 0;
+
+  try {
+    const channel = await prisma.channel.findUnique({
+      where: { id: channelId },
+    });
+    if (!channel) throw new Error("Channel not found");
+    if (channel.platform !== "YOUTUBE")
+      throw new Error("Channel is not a YouTube channel");
+    if (!channel.connected) throw new Error("Channel is not connected");
+
+    const accessToken = await getValidAccessToken(channelId);
+
+    const ytChannel = channel.externalId
+      ? await getChannelById(channel.externalId, accessToken)
+      : await getMyChannel(accessToken);
+    if (!ytChannel) throw new Error("Could not fetch channel from YouTube");
+
+    const today = toDateOnlyUTC(new Date());
+    // Preserve any analytics rows that the deep sync already wrote for today —
+    // we only touch the cumulative counters here.
+    await prisma.youTubeChannelSnapshot.upsert({
+      where: { channelId_date: { channelId, date: today } },
+      create: {
+        channelId,
+        date: today,
+        subscribers: bigInt(ytChannel.statistics?.subscriberCount),
+        viewCount: bigInt(ytChannel.statistics?.viewCount),
+        videoCount:
+          num(ytChannel.statistics?.videoCount) !== null
+            ? Math.round(num(ytChannel.statistics?.videoCount)!)
+            : null,
+      },
+      update: {
+        subscribers: bigInt(ytChannel.statistics?.subscriberCount),
+        viewCount: bigInt(ytChannel.statistics?.viewCount),
+        videoCount:
+          num(ytChannel.statistics?.videoCount) !== null
+            ? Math.round(num(ytChannel.statistics?.videoCount)!)
+            : null,
+      },
+    });
+    rowsWritten += 1;
+
+    const avatarUrl =
+      ytChannel.snippet?.thumbnails?.high?.url ??
+      ytChannel.snippet?.thumbnails?.medium?.url ??
+      ytChannel.snippet?.thumbnails?.default?.url ??
+      null;
+
+    const finishedAt = new Date();
+    detail.subscribers = ytChannel.statistics?.subscriberCount ?? "—";
+    detail.viewCount = ytChannel.statistics?.viewCount ?? "—";
+    detail.videoCount = ytChannel.statistics?.videoCount ?? "—";
+
+    await prisma.$transaction([
+      prisma.channel.update({
+        where: { id: channelId },
+        data: {
+          avatarUrl: avatarUrl ?? undefined,
+          // We intentionally don't touch syncStatus/syncError here — the
+          // heavy daily sync owns those. A light-sync failure is not a
+          // user-facing "your channel is broken" event.
+          lastLightSyncedAt: finishedAt,
+        },
+      }),
+      prisma.syncLog.update({
+        where: { id: log.id },
+        data: {
+          status: "SUCCESS",
+          finishedAt,
+          rowsWritten,
+          detail: detail as Prisma.InputJsonValue,
+        },
+      }),
+    ]);
+
+    return { ok: true, rowsWritten, detail };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await prisma.syncLog.update({
+      where: { id: log.id },
+      data: {
+        status: "ERROR" as SyncStatus,
+        finishedAt: new Date(),
+        rowsWritten,
+        errorMessage: msg,
+        detail: detail as Prisma.InputJsonValue,
+      },
+    });
     return { ok: false, error: msg, rowsWritten, detail };
   }
 }
